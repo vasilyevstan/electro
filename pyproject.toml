@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "estonia-nordpool-prices"
-version = "0.3.0"
-description = "CLI and MCP server for Estonia's current and next-day Nord Pool prices"
+version = "0.4.0"
+description = "CLI and MCP server for Estonia's published electricity prices and seven-day forecasts"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,4 +17,4 @@ nordpool-ee = "nordpool_ee:main"
 nordpool-ee-mcp = "mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["nordpool_ee", "mcp_server"]
+py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast"]

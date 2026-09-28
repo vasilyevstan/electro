@@ -39,6 +39,14 @@ def complete_payload(delivery_date, price_factory=None):
 
 
 class TimeWindowTests(unittest.TestCase):
+    def test_current_delivery_date_uses_tallinn_not_machine_timezone(self):
+        now_utc = datetime(2026, 9, 28, 21, 30, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            nordpool_ee.current_delivery_date(now_utc),
+            date(2026, 9, 29),
+        )
+
     def test_next_delivery_date_uses_tallinn_not_machine_timezone(self):
         now_utc = datetime(2026, 9, 28, 21, 30, tzinfo=timezone.utc)
 
@@ -50,6 +58,10 @@ class TimeWindowTests(unittest.TestCase):
     def test_next_delivery_date_rejects_naive_datetime(self):
         with self.assertRaisesRegex(ValueError, "timezone"):
             nordpool_ee.next_delivery_date(datetime(2026, 9, 28, 12, 0))
+
+    def test_current_delivery_date_rejects_naive_datetime(self):
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            nordpool_ee.current_delivery_date(datetime(2026, 9, 28, 12, 0))
 
     def test_regular_day_has_expected_utc_bounds_and_96_intervals(self):
         delivery_date = date(2026, 9, 29)

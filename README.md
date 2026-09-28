@@ -1,9 +1,9 @@
-# Estonia next-day electricity prices CLI and MCP server
+# Estonia electricity prices CLI and MCP server
 
 `nordpool_ee.py` is a small, dependency-free command-line tool that prints
 Estonia's Nord Pool day-ahead wholesale electricity prices for the next
-`Europe/Tallinn` calendar day. `mcp_server.py` exposes the same validated data
-as a typed Model Context Protocol tool over stdio.
+`Europe/Tallinn` calendar day. `mcp_server.py` exposes validated current-day
+and next-day data as typed Model Context Protocol tools over stdio.
 
 Repository: <https://github.com/vasilyevstan/electro>
 
@@ -73,19 +73,35 @@ uvx --from "git+https://github.com/vasilyevstan/electro.git@main" \
   nordpool-ee-mcp
 ```
 
-It exposes one tool:
+It exposes three tools:
 
 ```text
+get_estonia_current_day_prices
 get_estonia_next_day_prices
+get_estonia_prices_for_hour
 ```
 
-The tool takes no arguments and returns typed structured content containing:
+The current-day and next-day tools take no arguments and return typed
+structured content containing:
 
 - the Estonia bidding area and delivery date
 - timezone, currency, source, and interval metadata
 - every complete 15-minute interval in EUR/MWh and cents/kWh
 - minimum, maximum, and duration-weighted average prices
 - an explicit wholesale-only flag and excluded consumer costs
+
+The current-day response also includes `current_interval`, identifying the
+active Estonia quarter-hour price at the time of the call. The next-day
+response returns `null` for that field.
+
+`get_estonia_prices_for_hour` accepts:
+
+- `delivery_date`: an Estonia delivery date in `YYYY-MM-DD` format
+- `hour`: an Estonia local clock hour from `0` through `23`
+
+It returns all quarter-hour prices in that local hour plus the hourly minimum,
+maximum, and average. A repeated daylight-saving hour can contain eight
+intervals; a skipped hour returns a tool error rather than fabricated data.
 
 Expected retrieval failures are returned as MCP tool errors, not successful
 responses containing error text.
@@ -98,7 +114,7 @@ available in every new session:
 ```bash
 copilot mcp add \
   --transport stdio \
-  --tools get_estonia_next_day_prices \
+  --tools get_estonia_current_day_prices,get_estonia_next_day_prices,get_estonia_prices_for_hour \
   electro -- \
   uvx --from "git+https://github.com/vasilyevstan/electro.git@main" \
   nordpool-ee-mcp
@@ -119,7 +135,11 @@ The equivalent `~/.copilot/mcp-config.json` entry is:
         "git+https://github.com/vasilyevstan/electro.git@main",
         "nordpool-ee-mcp"
       ],
-      "tools": ["get_estonia_next_day_prices"]
+      "tools": [
+        "get_estonia_current_day_prices",
+        "get_estonia_next_day_prices",
+        "get_estonia_prices_for_hour"
+      ]
     }
   }
 }

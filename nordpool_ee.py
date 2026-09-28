@@ -62,11 +62,15 @@ class PriceSummary:
     average_eur_mwh: Decimal
 
 
-def next_delivery_date(now: Optional[datetime] = None) -> date:
+def current_delivery_date(now: Optional[datetime] = None) -> date:
     current = now if now is not None else datetime.now(TALLINN)
     if current.tzinfo is None:
         raise ValueError("now must include timezone information")
-    return current.astimezone(TALLINN).date() + timedelta(days=1)
+    return current.astimezone(TALLINN).date()
+
+
+def next_delivery_date(now: Optional[datetime] = None) -> date:
+    return current_delivery_date(now) + timedelta(days=1)
 
 
 def market_bounds(delivery_date: date) -> Tuple[datetime, datetime]:

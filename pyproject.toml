@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "estonia-nordpool-prices"
-version = "0.1.0"
-description = "CLI and MCP server for Estonia's next-day Nord Pool prices"
+version = "0.2.0"
+description = "CLI and MCP server for Estonia's current and next-day Nord Pool prices"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

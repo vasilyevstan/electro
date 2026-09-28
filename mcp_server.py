@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """MCP server for Estonia's current and next-day electricity prices."""
 
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated, List, Optional
+from itertools import groupby
+from typing import Annotated, List, Optional, Tuple
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -18,6 +19,7 @@ from nordpool_ee import (
     PriceError,
     PriceInterval,
     PriceReport,
+    PriceSummary,
     current_delivery_date,
     eur_mwh_to_cents_kwh,
     fetch_prices,
@@ -26,13 +28,27 @@ from nordpool_ee import (
 )
 
 
-@dataclass(frozen=True)
-class PricePoint:
-    """One Estonia day-ahead market interval."""
+VAT_RATE_PERCENT = Decimal("24")
+VAT_MULTIPLIER = Decimal("1") + VAT_RATE_PERCENT / Decimal("100")
 
-    start: str
+
+@dataclass(frozen=True)
+class PriceValues:
+    """The same energy price in EUR/MWh and euro cents/kWh."""
+
     eur_per_mwh: float
     cents_per_kwh: float
+
+
+@dataclass(frozen=True)
+class PricePoint:
+    """One market interval with explicit VAT-exclusive and inclusive prices."""
+
+    start: str
+    eur_per_mwh: Annotated[float, Field(description="Legacy VAT-exclusive price.")]
+    cents_per_kwh: Annotated[float, Field(description="Legacy VAT-exclusive price.")]
+    excluding_vat: PriceValues
+    including_vat: PriceValues
 
 
 @dataclass(frozen=True)
@@ -41,8 +57,26 @@ class PriceSummaryResult:
 
     minimum: PricePoint
     maximum: PricePoint
-    average_eur_per_mwh: float
-    average_cents_per_kwh: float
+    average_eur_per_mwh: Annotated[
+        float, Field(description="Legacy VAT-exclusive average.")
+    ]
+    average_cents_per_kwh: Annotated[
+        float, Field(description="Legacy VAT-exclusive average.")
+    ]
+    average_excluding_vat: PriceValues
+    average_including_vat: PriceValues
+
+
+@dataclass(frozen=True)
+class HourlyAverage:
+    """One elapsed hour, identified by offset-aware Estonia-local bounds."""
+
+    hour: int
+    start: str
+    end: str
+    interval_count: int
+    average_excluding_vat: PriceValues
+    average_including_vat: PriceValues
 
 
 @dataclass(frozen=True)
@@ -61,6 +95,9 @@ class EstoniaDayPrices:
     intervals: List[PricePoint]
     summary: PriceSummaryResult
     current_interval: Optional[PricePoint]
+    vat_rate_percent: float
+    hourly_averages: List[HourlyAverage]
+    current_hour: Optional[HourlyAverage]
 
 
 @dataclass(frozen=True)
@@ -78,6 +115,8 @@ class EstoniaHourPrices:
     source: str
     intervals: List[PricePoint]
     summary: PriceSummaryResult
+    vat_rate_percent: float
+    hourly_averages: List[HourlyAverage]
 
 
 mcp = MCPServer(
@@ -85,12 +124,15 @@ mcp = MCPServer(
     instructions=(
         "Use the tools to retrieve Estonia's complete current-day or next-day "
         "Nord Pool wholesale electricity prices, or prices for a specific "
-        "Estonia-local date and hour."
+        "Estonia-local date and hour. Show prices both excluding and including "
+        "VAT, labeling the basis and time period. For the current price, show "
+        "current_hour's average alongside current_interval's 15-minute price; "
+        "do not confuse the two. These are energy-component prices, not total "
+        "retail costs."
     ),
 )
 
 EXCLUDED_COSTS = [
-    "VAT",
     "supplier margin",
     "network charges",
     "excise",
@@ -98,12 +140,71 @@ EXCLUDED_COSTS = [
 ]
 
 
+def _price_values(price_eur_mwh: Decimal) -> PriceValues:
+    return PriceValues(
+        eur_per_mwh=float(price_eur_mwh),
+        cents_per_kwh=float(eur_mwh_to_cents_kwh(price_eur_mwh)),
+    )
+
+
 def _price_point(interval: PriceInterval) -> PricePoint:
+    excluding_vat = _price_values(interval.price_eur_mwh)
     return PricePoint(
         start=interval.start.isoformat(),
-        eur_per_mwh=float(interval.price_eur_mwh),
-        cents_per_kwh=float(eur_mwh_to_cents_kwh(interval.price_eur_mwh)),
+        eur_per_mwh=excluding_vat.eur_per_mwh,
+        cents_per_kwh=excluding_vat.cents_per_kwh,
+        excluding_vat=excluding_vat,
+        including_vat=_price_values(interval.price_eur_mwh * VAT_MULTIPLIER),
     )
+
+
+def _summary_result(summary: PriceSummary) -> PriceSummaryResult:
+    excluding_vat = _price_values(summary.average_eur_mwh)
+    return PriceSummaryResult(
+        minimum=_price_point(summary.minimum),
+        maximum=_price_point(summary.maximum),
+        average_eur_per_mwh=excluding_vat.eur_per_mwh,
+        average_cents_per_kwh=excluding_vat.cents_per_kwh,
+        average_excluding_vat=excluding_vat,
+        average_including_vat=_price_values(
+            summary.average_eur_mwh * VAT_MULTIPLIER
+        ),
+    )
+
+
+def _interval_report(
+    report: PriceReport,
+    intervals: Tuple[PriceInterval, ...],
+) -> PriceReport:
+    return replace(
+        report,
+        start_utc=intervals[0].start.astimezone(UTC),
+        end_utc=intervals[-1].start.astimezone(UTC) + MARKET_INTERVAL,
+        intervals=intervals,
+    )
+
+
+def _utc_hour_start(interval: PriceInterval) -> datetime:
+    return interval.start.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def _hourly_averages(report: PriceReport) -> List[HourlyAverage]:
+    hours = []
+    for start_utc, group in groupby(report.intervals, key=_utc_hour_start):
+        intervals = tuple(group)
+        average = summarize(_interval_report(report, intervals)).average_eur_mwh
+        start_local = start_utc.astimezone(TALLINN)
+        hours.append(
+            HourlyAverage(
+                hour=start_local.hour,
+                start=start_local.isoformat(),
+                end=(start_utc + timedelta(hours=1)).astimezone(TALLINN).isoformat(),
+                interval_count=len(intervals),
+                average_excluding_vat=_price_values(average),
+                average_including_vat=_price_values(average * VAT_MULTIPLIER),
+            )
+        )
+    return hours
 
 
 def _find_current_interval(
@@ -132,7 +233,7 @@ def build_price_result(
     report: PriceReport,
     current_time: Optional[datetime] = None,
 ) -> EstoniaDayPrices:
-    summary = summarize(report)
+    hourly_averages = _hourly_averages(report)
     current_interval = (
         _find_current_interval(report, current_time)
         if current_time is not None
@@ -149,16 +250,21 @@ def build_price_result(
         excluded_costs=list(EXCLUDED_COSTS),
         source=API_URL,
         intervals=[_price_point(interval) for interval in report.intervals],
-        summary=PriceSummaryResult(
-            minimum=_price_point(summary.minimum),
-            maximum=_price_point(summary.maximum),
-            average_eur_per_mwh=float(summary.average_eur_mwh),
-            average_cents_per_kwh=float(
-                eur_mwh_to_cents_kwh(summary.average_eur_mwh)
-            ),
-        ),
+        summary=_summary_result(summarize(report)),
         current_interval=(
             _price_point(current_interval)
+            if current_interval is not None
+            else None
+        ),
+        vat_rate_percent=float(VAT_RATE_PERCENT),
+        hourly_averages=hourly_averages,
+        current_hour=(
+            next(
+                hour
+                for hour in hourly_averages
+                if hour.start
+                == _utc_hour_start(current_interval).astimezone(TALLINN).isoformat()
+            )
             if current_interval is not None
             else None
         ),
@@ -194,9 +300,9 @@ def build_hour_price_result(
     report: PriceReport,
     hour: int,
 ) -> EstoniaHourPrices:
-    intervals = [
+    intervals = tuple(
         interval for interval in report.intervals if interval.start.hour == hour
-    ]
+    )
     if not intervals:
         raise ToolError(
             "No Estonia market intervals exist for {} at hour {:02d}; "
@@ -205,13 +311,7 @@ def build_hour_price_result(
             )
         )
 
-    minimum = min(intervals, key=lambda interval: interval.price_eur_mwh)
-    maximum = max(intervals, key=lambda interval: interval.price_eur_mwh)
-    average = sum(
-        (interval.price_eur_mwh for interval in intervals),
-        Decimal("0"),
-    ) / Decimal(len(intervals))
-
+    hour_report = _interval_report(report, intervals)
     return EstoniaHourPrices(
         area="EE",
         delivery_date=report.delivery_date.isoformat(),
@@ -223,12 +323,9 @@ def build_hour_price_result(
         excluded_costs=list(EXCLUDED_COSTS),
         source=API_URL,
         intervals=[_price_point(interval) for interval in intervals],
-        summary=PriceSummaryResult(
-            minimum=_price_point(minimum),
-            maximum=_price_point(maximum),
-            average_eur_per_mwh=float(average),
-            average_cents_per_kwh=float(eur_mwh_to_cents_kwh(average)),
-        ),
+        summary=_summary_result(summarize(hour_report)),
+        vat_rate_percent=float(VAT_RATE_PERCENT),
+        hourly_averages=_hourly_averages(hour_report),
     )
 
 
@@ -236,10 +333,10 @@ def build_hour_price_result(
 def get_estonia_current_day_prices() -> EstoniaDayPrices:
     """Get complete current-day Nord Pool prices for Estonia.
 
-    Returns each 15-minute interval in Europe/Tallinn local time and identifies
-    the currently active interval. Wholesale prices are in EUR/MWh and euro
-    cents/kWh; consumer taxes, supplier margin, network charges, and other fees
-    are excluded.
+    Returns 15-minute prices and hourly averages with and without VAT, in
+    EUR/MWh and euro cents/kWh. Show current_hour's average and the active
+    current_interval separately, using Estonia-local time. Supplier margin,
+    network charges, excise, and other fees remain excluded.
     """
 
     current_time = tallinn_now()
@@ -261,8 +358,10 @@ def get_estonia_prices_for_hour(
         hour: Estonia local clock hour from 0 through 23.
 
     Returns every 15-minute market interval in the requested hour plus minimum,
-    maximum, and average wholesale prices. A repeated daylight-saving hour can
-    contain eight intervals; a skipped hour returns a tool error.
+    maximum, and average prices with and without VAT. Repeated daylight-saving
+    hours include two offset-distinct hourly_averages and eight intervals;
+    summary averages both occurrences. A skipped hour returns a tool error.
+    Supplier margin, network charges, excise, and other fees remain excluded.
     """
 
     try:
@@ -282,9 +381,9 @@ def get_estonia_prices_for_hour(
 def get_estonia_next_day_prices() -> EstoniaDayPrices:
     """Get complete next-day Nord Pool prices for Estonia.
 
-    Returns each 15-minute interval in Europe/Tallinn local time, with
-    wholesale prices in EUR/MWh and euro cents/kWh. Consumer taxes, supplier
-    margin, network charges, and other fees are excluded.
+    Returns each 15-minute interval and hourly averages in Europe/Tallinn local
+    time, with and without VAT, in EUR/MWh and euro cents/kWh. Supplier margin,
+    network charges, excise, and other fees remain excluded.
     """
 
     return _get_prices(next_delivery_date())

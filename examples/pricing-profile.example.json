@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "id": "synthetic-example",
+  "version": "example-1",
+  "currency": "EUR",
+  "timezone": "Europe/Tallinn",
+  "from": "2026-01-01",
+  "until": "2027-01-01",
+  "rounding": "ROUND_HALF_UP",
+  "notes": [
+    "SYNTHETIC EXAMPLE: all rates, tax fractions and change dates are invented. Do not use this profile for real bills.",
+    "This example demonstrates line rounding and section VAT, not a supplier's verified tie policy."
+  ],
+  "sources": [
+    {
+      "id": "example",
+      "basis": "synthetic",
+      "description": "Invented demonstration data, not a household contract or supplier tariff.",
+      "reference": "README.md#household-electricity-pricing-mcp"
+    }
+  ],
+  "netting": [
+    {"from": "2026-01-01", "until": "2026-07-01", "mode": "gross", "source_ids": ["example"]},
+    {"from": "2026-07-01", "until": null, "mode": "quarter_hour_net", "source_ids": ["example"]}
+  ],
+  "components": [
+    {
+      "id": "purchase_energy", "section": "purchase", "label": "Purchased electricity",
+      "kind": "spot", "direction": "import",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "0.0025", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "supplier_monthly", "section": "purchase", "label": "Supplier monthly fee", "kind": "monthly",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "2.345", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "balancing_import", "section": "purchase", "label": "Import balancing fee",
+      "kind": "unit", "direction": "import",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "0.004", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "network_transmission", "section": "network", "label": "Network transmission",
+      "kind": "banded", "direction": "import",
+      "rules": [
+        {
+          "from": "2026-01-01", "until": "2026-07-01",
+          "band_rates": {"day": "0.065", "night": "0.035", "weekday_peak": "0.085", "rest_peak": "0.05"},
+          "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]
+        },
+        {
+          "from": "2026-07-01", "until": null,
+          "band_rates": {"day": "0.075", "night": "0.04"},
+          "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]
+        }
+      ]
+    },
+    {
+      "id": "network_monthly", "section": "network", "label": "Network monthly fee", "kind": "monthly",
+      "rules": [
+        {"from": "2026-01-01", "until": "2026-07-01", "rate": "12.50", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]},
+        {"from": "2026-07-01", "until": null, "rate": "13.75", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "renewable_fee", "section": "network", "label": "Renewable energy fee",
+      "kind": "unit", "direction": "import",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "0.007", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "security_fee", "section": "network", "label": "Security of supply fee",
+      "kind": "unit", "direction": "import",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "0.005", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "excise", "section": "network", "label": "Electricity excise",
+      "kind": "unit", "direction": "import",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "0.002", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "export_energy", "section": "export", "label": "Exported electricity credit",
+      "kind": "spot", "direction": "export",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "-0.015", "tax_treatment": "outside_vat", "vat_rate": "0", "source_ids": ["example"]}
+      ]
+    },
+    {
+      "id": "balancing_export", "section": "export", "label": "Export balancing fee",
+      "kind": "unit", "direction": "export",
+      "rules": [
+        {"from": "2026-01-01", "until": null, "rate": "0.004", "tax_treatment": "taxable", "vat_rate": "0.20", "source_ids": ["example"]}
+      ]
+    }
+  ]
+}

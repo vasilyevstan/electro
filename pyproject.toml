@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "estonia-nordpool-prices"
-version = "0.5.0"
-description = "CLI and MCP servers for Estonia's electricity prices, forecasts and household consumption"
+version = "0.6.0"
+description = "CLI and MCP servers for Estonia's electricity prices, forecasts, consumption and configurable costs"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
 nordpool-ee = "nordpool_ee:main"
 nordpool-ee-mcp = "mcp_server:main"
 elering-kodala-consumption-mcp = "elering_consumption_mcp:main"
+electrisity-price-mcp = "electricity_pricing_mcp:main"
 
 [tool.setuptools]
-py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consumption", "elering_consumption_mcp"]
+py-modules = ["nordpool_ee", "mcp_server", "wattcast_forecast", "elering_consumption", "elering_consumption_mcp", "electricity_pricing", "electricity_pricing_mcp"]

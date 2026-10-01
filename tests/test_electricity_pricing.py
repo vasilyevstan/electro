@@ -176,6 +176,217 @@ class QuoteTests(unittest.TestCase):
             pricing.quote_interval(self.profile, row, prices_for([row]))
 
 
+class ScenarioTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = pricing.parse_profile(example())
+
+    def test_power_and_energy_allocate_identical_partial_quarters(self):
+        start = "2026-08-03T10:07:30.123456+03:00"
+        power = pricing.make_load(self.profile, start, "60", power_kw="2")
+        energy = pricing.make_load(self.profile, start, "60", energy_kwh="2")
+        self.assertEqual(power, energy)
+        self.assertEqual(
+            [row.consumption_kwh for row in power.intervals],
+            [D("0.249931413333333333"), D("0.5"), D("0.5"), D("0.5"), D("0.250068586666666667")],
+        )
+        self.assertEqual(sum(row.consumption_kwh for row in power.intervals), D(2))
+        self.assertEqual(power.allocation[0].active_start, start)
+        self.assertEqual(power.allocation[-1].active_end, "2026-08-03T11:07:30.123456+03:00")
+        self.assertEqual(power.allocation[0].start, "2026-08-03T10:00:00+03:00")
+        self.assertEqual(power.allocation[-1].end, "2026-08-03T11:15:00+03:00")
+
+    def test_all_variable_fees_are_included_and_fixed_fees_are_not(self):
+        load = pricing.make_load(self.profile, "2026-08-03T10:07:30+03:00", 60, power_kw=2)
+        result = pricing.price_scenario(self.profile, load.intervals, prices_for(load.intervals))
+        self.assertEqual(result.amounts.excluding_vat_eur, "0.391")
+        self.assertEqual(result.amounts.vat_eur, "0.0782")
+        self.assertEqual(result.amounts.including_vat_eur, "0.4692")
+        lines = {line.component_id for line in result.lines}
+        self.assertEqual(lines, {
+            "purchase_energy", "balancing_import", "network_transmission", "renewable_fee",
+            "security_fee", "excise", "export_energy", "balancing_export",
+        })
+        self.assertEqual(result.fixed_fees, "excluded")
+        self.assertEqual(result.energy_kwh, "2")
+        self.assertIsNone(result.baseline)
+        self.assertIsNone(result.scenario.raw_import_kwh)
+        self.assertTrue(all(line.quantity_kwh is not None for line in result.lines))
+
+    def test_partial_energy_uses_its_own_price_without_an_extra_duration_factor(self):
+        profile = profile_with(component(kind="spot", rate="0", vat="0"))
+        load = pricing.make_load(profile, "2026-08-03T10:07:30+03:00", 60, energy_kwh="2")
+        prices = {row.start: D(value) for row, value in zip(load.intervals, (0, 100, 200, -50, 400))}
+        result = pricing.price_scenario(profile, load.intervals, prices)
+        self.assertEqual(result.amounts.including_vat_eur, "0.225")
+
+    def test_cumulative_allocation_preserves_energy_within_input_precision(self):
+        for value in ("0", "0.000000000000000001", "1", "123456.123456789012345678",
+                      "999999999999999.999999999", "1000000000000000"):
+            with self.subTest(energy=value):
+                load = pricing.make_load(
+                    self.profile, "2026-08-03T10:00:00.000001+03:00", "47", energy_kwh=value,
+                )
+                self.assertEqual(sum(row.consumption_kwh for row in load.intervals), D(value))
+                self.assertTrue(all(row.consumption_kwh >= 0 for row in load.intervals))
+                pricing.scenario_bounds(self.profile, load.intervals, "billable")
+        power = pricing.make_load(self.profile, "2026-08-03T10:00:00+03:00", 1, power_kw=1)
+        self.assertEqual(power.intervals[0].consumption_kwh, D("0.016666666666666667"))
+
+    def test_zero_load_still_excludes_fixed_fees(self):
+        load = pricing.make_load(self.profile, "2026-08-03T10:00:00+03:00", 60, energy_kwh="0")
+        result = pricing.price_scenario(self.profile, load.intervals, prices_for(load.intervals))
+        self.assertEqual(result.amounts.including_vat_eur, "0")
+        self.assertEqual(result.energy_kwh, "0")
+        self.assertEqual(result.fixed_fees, "excluded")
+
+    def test_load_validation_rejects_ambiguity_precision_and_unsupported_bounds(self):
+        cases = [
+            {"power_kw": None},
+            {"power_kw": "1", "energy_kwh": "1"},
+            {"power_kw": "-1"},
+            {"power_kw": True},
+            {"power_kw": "NaN"},
+            {"energy_kwh": "-1"},
+            {"power_kw": "1", "duration_minutes": 0},
+            {"power_kw": "1", "duration_minutes": -1},
+            {"power_kw": "1", "duration_minutes": True},
+            {"power_kw": "1", "duration_minutes": "0.0000000001"},
+            {"power_kw": "1", "duration_minutes": "1000000000000000"},
+            {"power_kw": "0.000000000000000001", "duration_minutes": "0.00000005"},
+            {"power_kw": "1000000000000000", "duration_minutes": 120},
+            {"power_kw": "1", "start": "2026-08-03T10:00:00"},
+            {"power_kw": "1", "start": "2026-08-03T10:00:00.0000001+03:00"},
+            {"power_kw": "1", "start": "2026-12-31T23:30:00+02:00"},
+            {"power_kw": "1", "start": "2025-12-31T23:30:00+02:00"},
+        ]
+        for extra in cases:
+            arguments = {"start": "2026-08-03T10:00:00+03:00", "duration_minutes": 60, **extra}
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(pricing.PricingError):
+                    pricing.make_load(self.profile, **arguments)
+
+    def test_day_night_and_effective_date_changes_split_load_correctly(self):
+        load = pricing.make_load(self.profile, "2026-08-03T21:52:30+03:00", 15, power_kw=8)
+        result = pricing.price_scenario(self.profile, load.intervals, prices_for(load.intervals))
+        lines = {line.line_id: line for line in result.lines}
+        self.assertEqual(lines["network_transmission:day"].net_eur, "0.075")
+        self.assertEqual(lines["network_transmission:night"].net_eur, "0.04")
+        self.assertEqual(result.amounts.including_vat_eur, "0.4272")
+
+        fee = component(rate="1")
+        fee["rules"] = [rule("1", "0.20", end="2026-07-01"), rule("2", "0.30", start="2026-07-01")]
+        profile = profile_with(fee)
+        load = pricing.make_load(profile, "2026-06-30T23:52:30+03:00", 15, power_kw=8)
+        result = pricing.price_scenario(profile, load.intervals, prices_for(load.intervals))
+        self.assertEqual(result.amounts.including_vat_eur, "3.8")
+        self.assertEqual({group.vat_rate for group in result.vat_groups}, {"0.2", "0.3"})
+        self.assertEqual({line.billing_month for line in result.lines}, {"2026-06", "2026-07"})
+
+    def test_load_and_comparison_follow_real_time_across_both_dst_changes(self):
+        for start, end in (
+            ("2026-03-29T02:45:00+02:00", "2026-03-29T04:45:00+03:00"),
+            ("2026-10-25T03:45:00+03:00", "2026-10-25T03:45:00+02:00"),
+        ):
+            with self.subTest(start=start):
+                load = pricing.make_load(self.profile, start, 60, power_kw=1)
+                self.assertEqual(load.end.astimezone(TALLINN).isoformat(), end)
+                self.assertEqual(len(load.intervals), 4)
+                self.assertEqual(sum(row.consumption_kwh for row in load.intervals), D(1))
+                local_rows = [
+                    replace(row, start=row.start.astimezone(TALLINN), end=row.end.astimezone(TALLINN))
+                    for row in reversed(load.intervals)
+                ]
+                result = pricing.price_scenario(
+                    self.profile, local_rows, prices_for(load.intervals), "billable", load.intervals,
+                )
+                self.assertEqual(result.amounts.including_vat_eur, "0")
+
+    def test_comparison_includes_lost_export_credit_and_reduced_export_fees(self):
+        row = pricing.make_interval("2026-08-03T10:00:00+03:00", "2026-08-03T10:15:00+03:00", "0", "2")
+        after = replace(row, consumption_kwh=D(1), export_kwh=D(0))
+        result = pricing.price_scenario(self.profile, [after], prices_for([row]), "raw", [row])
+        self.assertEqual(result.amounts.excluding_vat_eur, "0.3575")
+        self.assertEqual(result.amounts.vat_eur, "0.0375")
+        self.assertEqual(result.amounts.including_vat_eur, "0.395")
+        self.assertEqual(result.amounts.outside_vat_eur, "0.17")
+        lines = {line.line_id: line for line in result.lines}
+        self.assertEqual(lines["export_energy"].net_eur, "0.17")
+        self.assertEqual(lines["export_energy"].tax_treatment, "outside_vat")
+        self.assertEqual(lines["balancing_export"].net_eur, "-0.008")
+        self.assertEqual(result.baseline.billable_export_kwh, "2")
+        self.assertEqual(result.scenario.billable_import_kwh, "1")
+        self.assertIsNone(result.energy_kwh)
+        for name in ("excluding_vat_eur", "vat_eur", "including_vat_eur", "outside_vat_eur", "taxable_net_eur"):
+            self.assertEqual(
+                D(getattr(result.amounts, name)),
+                D(getattr(result.scenario.amounts, name)) - D(getattr(result.baseline.amounts, name)),
+            )
+
+    def test_negative_prices_allow_negative_import_cost_and_export_avoidance_savings(self):
+        load = pricing.make_load(self.profile, "2026-08-03T10:00:00+03:00", 15, energy_kwh="1")
+        imported = pricing.price_scenario(self.profile, load.intervals, prices_for(load.intervals, "-300"))
+        self.assertLess(D(imported.amounts.including_vat_eur), 0)
+        row = replace(load.intervals[0], consumption_kwh=D(0), export_kwh=D(2))
+        after = replace(row, export_kwh=D(0))
+        avoided = pricing.price_scenario(self.profile, [after], prices_for([row], "-10"), "raw", [row])
+        self.assertEqual(avoided.amounts.including_vat_eur, "-0.0596")
+
+    def test_supplied_battery_charge_discharge_and_losses_are_priced_without_a_model(self):
+        before = readings("2026-08-03", imported="0")[40:42]
+        before[1] = replace(before[1], consumption_kwh=D(1))
+        after = [replace(before[0], consumption_kwh=D("1.25")), replace(before[1], consumption_kwh=D(0))]
+        prices = {before[0].start: D(20), before[1].start: D(200)}
+        result = pricing.price_scenario(self.profile, after, prices, "raw", before)
+        self.assertEqual(result.amounts.including_vat_eur, "-0.18135")
+        self.assertEqual(result.scenario.raw_import_kwh, "1.25")
+        self.assertEqual(result.baseline.raw_import_kwh, "1")
+        self.assertIsNone(result.energy_kwh)
+        self.assertTrue(any("Recharge costs" in warning for warning in result.warnings))
+
+    def test_comparison_applies_historical_netting_to_both_sides_without_double_netting(self):
+        before = readings("2026-06-30", "2026-07-01", imported="2", exported="1")[95:97]
+        after = [replace(row, consumption_kwh=D(3), export_kwh=D(2)) for row in before]
+        result = pricing.price_scenario(self.profile, after, prices_for(before), "raw", before)
+        self.assertEqual(result.baseline.billable_import_kwh, "3")
+        self.assertEqual(result.baseline.billable_export_kwh, "1")
+        self.assertEqual(result.scenario.billable_import_kwh, "4")
+        self.assertEqual(result.scenario.billable_export_kwh, "2")
+        self.assertTrue(all(D(line.net_eur) == 0 for line in result.lines if line.billing_month == "2026-07"))
+        billed_before = [before[0], replace(before[1], consumption_kwh=D(1), export_kwh=D(0))]
+        billed_after = [after[0], replace(after[1], consumption_kwh=D(1), export_kwh=D(0))]
+        billed = pricing.price_scenario(self.profile, billed_after, prices_for(before), "billable", billed_before)
+        self.assertEqual(result.amounts, billed.amounts)
+
+    def test_incomplete_or_mismatched_scenarios_and_missing_prices_fail(self):
+        rows = readings("2026-08-03")[40:43]
+        variants = [
+            [], rows[:-1], [rows[0], rows[0], rows[2]],
+            [replace(rows[0], end=rows[0].end + MARKET_INTERVAL), *rows[1:]],
+            [replace(rows[0], export_kwh=None), *rows[1:]],
+            [replace(rows[0], consumption_kwh=None), *rows[1:]],
+            [replace(row, start=row.start + timedelta(minutes=1), end=row.end + timedelta(minutes=1)) for row in rows],
+            [replace(row, start=row.start.replace(tzinfo=None), end=row.end.replace(tzinfo=None)) for row in rows],
+        ]
+        for baseline in variants:
+            with self.subTest(baseline=baseline):
+                with self.assertRaises(pricing.PricingError):
+                    pricing.price_scenario(self.profile, rows, prices_for(rows), "raw", baseline)
+        with self.assertRaisesRegex(pricing.PricingError, "missing"):
+            pricing.price_scenario(self.profile, rows, {}, "raw", rows)
+        with self.assertRaises(pricing.PricingError):
+            pricing.price_scenario(self.profile, rows, prices_for(rows), "raw")
+
+    def test_comparison_preserves_invoice_derived_profile_qualification(self):
+        value = example()
+        value["sources"][0]["basis"] = "invoice_derived"
+        profile = pricing.parse_profile(value)
+        rows = readings("2026-08-03")[40:41]
+        result = pricing.price_scenario(profile, rows, prices_for(rows), "raw", rows)
+        self.assertEqual(result.profile.sha256, profile.sha256)
+        self.assertTrue(result.profile.invoice_derived_rules_used)
+        self.assertTrue(any("invoice-derived" in warning.lower() for warning in result.warnings))
+
+
 class CalendarTests(unittest.TestCase):
     def test_statutory_holidays_and_not_easter_monday(self):
         holidays = pricing.estonian_holidays(2026)

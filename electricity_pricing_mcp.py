@@ -20,11 +20,16 @@ from electricity_pricing import (
     PricingProfile,
     PricingResult,
     QuantityBasis,
+    ScenarioMode,
+    ScenarioResult,
     load_profile,
     make_interval,
+    make_load,
     period_bounds,
     price_period,
+    price_scenario,
     quote_interval,
+    scenario_bounds,
     validate_intervals,
 )
 from nordpool_ee import API_URL, MARKET_INTERVAL, TALLINN, UTC, PriceError, fetch_prices_range
@@ -51,7 +56,12 @@ mcp = MCPServer(
         "are credits. Display invoice-derived rate qualifications and profile "
         "version/hash. A calculated total is not a supplier invoice or account "
         "balance. Use actual offset-aware 15-minute delivery intervals; never "
-        "distribute hourly/monthly kWh into invented quarters. Keep raw and "
+        "distribute measured hourly/monthly kWh into invented quarters. Only "
+        "estimate_electricity_scenario may allocate an explicitly hypothetical "
+        "constant-power or uniform-energy load. Its load mode assumes additional "
+        "grid import; comparison mode prices supplied before/after grid profiles "
+        "without inferring solar/battery behavior. Both exclude unchanged "
+        "monthly fees and return unrounded incremental costs. Keep raw and "
         "billable quantities distinct. Report mode allocates fixed fees by "
         "calendar day and returns unrounded amounts. Monthly mode finalizes "
         "component lines and section VAT separately for each complete month. "
@@ -192,6 +202,95 @@ def calculate_electricity_period(
             readings_retrieved_at=readings_retrieved_at,
             prices_retrieved_at=tallinn_now().isoformat(),
             warnings=result.warnings + warnings,
+        )
+    except (PricingError, ConsumptionError, PriceError) as error:
+        raise ToolError(str(error)) from None
+
+
+@mcp.tool(title="Estimate extra electricity cost for an appliance or grid scenario", annotations=_READ_ONLY)
+def estimate_electricity_scenario(
+    mode: ScenarioMode = "load",
+    start: Optional[str] = None,
+    duration_minutes: Optional[EnergyNumber] = None,
+    power_kw: Optional[EnergyNumber] = None,
+    energy_kwh: Optional[EnergyNumber] = None,
+    baseline_intervals: Optional[List[IntervalInput]] = None,
+    scenario_intervals: Optional[List[IntervalInput]] = None,
+    quantity_basis: Optional[QuantityBasis] = None,
+) -> ScenarioResult:
+    """Estimate a change in variable electricity charges, including network fees and VAT.
+
+    load: supply an offset-aware start, positive duration_minutes and exactly
+    one of power_kw or energy_kwh. Assume constant power/uniform hypothetical
+    energy and all additional grid import. Partial quarters are allocated by
+    elapsed time. No solar, battery or thermostat behavior is inferred. Omit
+    interval profiles and quantity_basis; the generated load is billable.
+
+    comparison: supply baseline_intervals and scenario_intervals with known
+    import AND export in every aligned 15-minute interval of the same window.
+    quantity_basis defaults to raw. Omit all load-mode arguments. Supplied
+    profiles already include the caller's solar/battery behavior; only costs
+    represented inside their window count. No readings are fetched or guessed.
+
+    Top-level amounts, lines and vat_groups are scenario minus baseline
+    (or additional load only), unrounded and excluding unchanged monthly fees.
+    Positive is added cost; negative is saving. Export credits remain outside
+    VAT where configured. Published prices only; no forecast fallback.
+    """
+    try:
+        profile = _profile()
+        load = None
+        before = None
+        if mode == "load":
+            if start is None or duration_minutes is None:
+                raise PricingError("Load mode requires start and duration_minutes.")
+            if baseline_intervals is not None or scenario_intervals is not None or quantity_basis is not None:
+                raise PricingError("Load mode does not accept interval profiles or quantity_basis; its energy is additional billable import.")
+            load = make_load(profile, start, duration_minutes, power_kw, energy_kwh)
+            rows = list(load.intervals)
+            basis: QuantityBasis = "billable"
+        elif mode == "comparison":
+            if any(value is not None for value in (start, duration_minutes, power_kw, energy_kwh)):
+                raise PricingError("Comparison mode takes only before/after profiles and their quantity_basis, not load-mode arguments.")
+            if baseline_intervals is None or scenario_intervals is None:
+                raise PricingError("Comparison mode requires both baseline_intervals and scenario_intervals.")
+            before = [
+                make_interval(row.start, row.end, row.consumption_kwh, row.export_kwh)
+                for row in baseline_intervals
+            ]
+            rows = [
+                make_interval(row.start, row.end, row.consumption_kwh, row.export_kwh)
+                for row in scenario_intervals
+            ]
+            basis = "raw" if quantity_basis is None else quantity_basis
+        else:
+            raise PricingError("mode must be load or comparison.")
+        first, last = scenario_bounds(profile, rows, basis)
+        if before is not None and scenario_bounds(profile, before, basis) != (first, last):
+            raise PricingError("Baseline and scenario must cover exactly the same accounting window.")
+        prices = _market_prices(
+            first.astimezone(TALLINN).date(),
+            (last - timedelta(microseconds=1)).astimezone(TALLINN).date(),
+        )
+        result = price_scenario(profile, rows, prices, basis, before)
+        if load is not None:
+            result = replace(
+                result, start=load.start.astimezone(TALLINN).isoformat(),
+                end=load.end.astimezone(TALLINN).isoformat(),
+                energy_allocation=list(load.allocation),
+                warnings=result.warnings + [
+                    "Hypothetical constant power/uniform energy, not redistributed measurements. Derived kWh use at most 24 significant digits and 18 decimal places; allocation preserves the represented total.",
+                ],
+            )
+        retrieved = tallinn_now().isoformat()
+        return replace(
+            result, price_source=API_URL, prices_retrieved_at=retrieved,
+            baseline=replace(result.baseline, price_source=API_URL, prices_retrieved_at=retrieved)
+            if result.baseline is not None else None,
+            scenario=replace(
+                result.scenario, input_source=result.input_source,
+                price_source=API_URL, prices_retrieved_at=retrieved,
+            ),
         )
     except (PricingError, ConsumptionError, PriceError) as error:
         raise ToolError(str(error)) from None

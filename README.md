@@ -494,12 +494,15 @@ is outside VAT. Negative spot prices and negative export proceeds are retained.
 | --- | --- |
 | `quote_electricity_interval` | Offset-aware `start`/`end` for exactly one aligned 15-minute interval, `consumption_kwh` and/or `export_kwh`, and `quantity_basis` (`raw` by default, or `billable`). Returns variable costs before VAT, VAT and after VAT; monthly fees are excluded. |
 | `calculate_electricity_period` | `start_date`, optional inclusive `end_date`, optional `intervals`, `quantity_basis`, `mode` (`report` or `monthly`) and optional `include_daily`. Supports complete days, weeks, months and multi-month/year ranges. |
+| `estimate_electricity_scenario` | `mode="load"` for constant kW or uniformly distributed hypothetical kWh over a run, or `mode="comparison"` for supplied before/after quarter-hour grid profiles. Returns the incremental variable cost, including network, statutory fees and VAT, but not unchanged monthly fees. |
 
 Quantities are interval **kWh**, not power. They are multiplied by their
 matching market price without another duration factor. Decimal strings are
 preferred; numeric readings from the consumption MCP are also accepted at
-their supplied precision. No hourly/monthly quantity is distributed into
-invented quarters.
+their supplied precision. No measured hourly/monthly quantity is distributed
+into invented quarters. Only the scenario tool's explicit hypothetical load
+mode allocates energy by a declared constant-power/uniform-energy assumption.
+Timestamps require UTC offsets and may not lose sub-microsecond precision.
 
 An interval quote can select just one explicitly billable direction. Raw
 quotes require both directions whenever netting applies. Period calculations
@@ -544,6 +547,98 @@ Alternatively, supply `intervals` containing the consumption MCP's
 not an automatic-retrieval request. Caller-provided quantities are identified
 as such, including hypothetical future quantities when the market prices
 have actually been published.
+
+### Appliance estimates and before/after scenarios
+
+For a **hypothetical all-grid load**, call `estimate_electricity_scenario`
+with an offset-aware start, positive duration in minutes, and exactly one of
+`power_kw` or `energy_kwh`:
+
+```json
+{
+  "mode": "load",
+  "start": "2026-08-03T10:07:30+03:00",
+  "duration_minutes": "60",
+  "power_kw": "2"
+}
+```
+
+The example represents a constant 2 kW load for one hour, or 2 kWh.
+Alternatively, replace `power_kw` with `"energy_kwh": "2"` to explicitly
+spread that hypothetical energy evenly across the run. These are scenario
+assumptions, **not measurements or inferred appliance consumption**.
+All energy in this mode is additional **billable grid import**; it does not
+assume the rest of the household consumes zero. Omit `quantity_basis` and
+both interval profiles in load mode. Zero power/energy is valid; zero or
+negative duration is not.
+
+Partial first/last market quarters are allocated by real elapsed overlap.
+UTC arithmetic preserves duration through daylight-saving changes, while
+network bands and displayed times use Tallinn time. Derived energy uses at
+most 24 significant digits and 18 decimal places; cumulative allocation
+preserves the represented total without accumulating rounding drift.
+Durations must resolve to whole microseconds and stay within profile coverage.
+
+For **solar/battery-aware pricing**, supply complete before-and-after grid
+profiles instead. The following synthetic example reduces export and
+increases import:
+
+```json
+{
+  "mode": "comparison",
+  "quantity_basis": "raw",
+  "baseline_intervals": [
+    {
+      "start": "2026-08-03T10:00:00+03:00",
+      "end": "2026-08-03T10:15:00+03:00",
+      "consumption_kwh": "0",
+      "export_kwh": "2"
+    }
+  ],
+  "scenario_intervals": [
+    {
+      "start": "2026-08-03T10:00:00+03:00",
+      "end": "2026-08-03T10:15:00+03:00",
+      "consumption_kwh": "1",
+      "export_kwh": "0"
+    }
+  ]
+}
+```
+
+Comparison mode takes no load-mode start, duration, power or energy argument.
+Both profiles need known import **and** export in every aligned 15-minute
+interval over the same window; their bounds define the comparison period.
+`quantity_basis` defaults to `raw` and applies to both sides. Historical
+gross-flow or quarter-hour netting rules are applied separately to each
+profile; explicitly billable inputs are not netted again.
+
+The tool prices **scenario minus baseline**, including lost export credits,
+changes in import/export balancing, transmission, statutory fees, excise
+and each component's VAT treatment. A negative result is a saving, not an
+error. It does not infer solar output, battery state, dispatch or efficiency.
+Recharge energy, battery losses and later export changes count only when
+represented in the supplied comparison window. Data outside that window is
+not silently assumed free or included. Use the existing consumption MCP to
+obtain actual baseline readings when appropriate; this tool never retrieves
+or substitutes household readings automatically.
+
+In both modes, top-level `amounts`, `lines` and `vat_groups` describe the
+**unrounded incremental cost**, not the whole household's bill. `baseline`
+(null for a load estimate) and `scenario` show the separately priced variable
+costs and quantities. `start`/`end` describe the requested run or comparison;
+`accounting_start`/`accounting_end` describe the containing full quarters.
+`energy_allocation` records the active overlap and kWh in each load quarter;
+`energy_kwh` is null in comparison mode because grid differences do not
+establish appliance energy use.
+
+Unchanged monthly fees are excluded. Prices and the profile are shared
+across both sides from one request snapshot, with source, version/hash and
+invoice-derived qualifications retained. Unpublished prices, missing rates,
+incomplete/mismatched profiles or mixed input modes fail explicitly.
+There are no forecasts, appliance controls or silent missing-as-zero defaults.
+An estimate is not an exact difference between two cent-rounded monthly
+invoices; use the existing monthly calculation for complete energy bills.
 
 ### Reporting versus invoice arithmetic
 
@@ -620,7 +715,8 @@ Add an entry without replacing existing servers:
       },
       "tools": [
         "quote_electricity_interval",
-        "calculate_electricity_period"
+        "calculate_electricity_period",
+        "estimate_electricity_scenario"
       ],
       "timeout": 600000
     }

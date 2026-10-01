@@ -115,13 +115,13 @@ def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError("invalid JSON constant: {}".format(value))
 
 
-def fetch_payload(
-    delivery_date: date,
+def _fetch_payload_url(
+    url: str,
     timeout: int = REQUEST_TIMEOUT_SECONDS,
     opener: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
     request = Request(
-        build_api_url(delivery_date),
+        url,
         headers={
             "Accept": "application/json",
             "User-Agent": "electro-nordpool-ee/1.0",
@@ -159,6 +159,14 @@ def fetch_payload(
     if not isinstance(payload, dict):
         raise PriceDataError("Elering response must be a JSON object")
     return payload
+
+
+def fetch_payload(
+    delivery_date: date,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    opener: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    return _fetch_payload_url(build_api_url(delivery_date), timeout, opener)
 
 
 def _parse_timestamp(value: Any, record_number: int) -> int:
@@ -279,6 +287,28 @@ def fetch_prices(
     return normalize_payload(
         fetch_payload(delivery_date, timeout=timeout, opener=opener),
         delivery_date,
+    )
+
+
+def fetch_prices_range(
+    first: date,
+    last: date,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    opener: Optional[Callable[..., Any]] = None,
+) -> Tuple[PriceReport, ...]:
+    """Fetch at most 31 local calendar days, retaining strict per-day validation."""
+    if type(first) is not date or type(last) is not date or last < first or (last - first).days >= 31:
+        raise PriceDataError("price ranges must contain 1 to 31 calendar days")
+    start, _ = market_bounds(first)
+    _, end = market_bounds(last)
+    query = urlencode({
+        "start": _format_api_timestamp(start),
+        "end": _format_api_timestamp(end - timedelta(milliseconds=1)),
+    })
+    payload = _fetch_payload_url("{}?{}".format(API_URL, query), timeout, opener)
+    return tuple(
+        normalize_payload(payload, first + timedelta(days=offset))
+        for offset in range((last - first).days + 1)
     )
 
 

@@ -7,6 +7,8 @@ next-day and date/hour prices, plus a separate experimental seven-day forecast,
 as typed Model Context Protocol tools over stdio.
 The separate `elering-kodala-consumption` MCP reads authorized household
 electricity consumption and grid export from Elering's customer API.
+The separate `electrisity-price` MCP calculates household energy costs and
+export credits using an effective-dated private tariff profile.
 
 Repository: <https://github.com/vasilyevstan/electro>
 
@@ -16,7 +18,8 @@ Repository: <https://github.com/vasilyevstan/electro>
 - Internet access to `dashboard.elering.ee`
 - Internet access to `wattcast.eu` for the optional forecast tool (no API key)
 - Elering customer API credentials and access to `estfeed.elering.ee` and
-  `kc.elering.ee` for the separate household-consumption MCP only
+  `kc.elering.ee` for household consumption and automatic household pricing;
+  pricing supplied readings or individual quantities needs no household credentials
 - [`uv`](https://docs.astral.sh/uv/)
 
 ## Setup
@@ -423,6 +426,212 @@ Keep household EICs, readings, credentials and private API captures out of
 public fixtures, documentation and CI logs. Deterministic tests use synthetic
 data; live account checks belong on the authorized local machine.
 
+## Household electricity pricing MCP
+
+`electrisity-price` is a third **read-only stdio server**. It uses a private
+JSON tariff profile, published market prices and either supplied readings or
+the existing Elering customer client. It does not alter the other MCPs,
+control appliances, use forecasts, learn rates automatically or run a hosted
+service.
+
+### Private configuration
+
+Start with [the synthetic example](examples/pricing-profile.example.json),
+outside the repository:
+
+```bash
+mkdir -p ~/.config/electro/pricing
+chmod 700 ~/.config/electro/pricing
+cp -n examples/pricing-profile.example.json ~/.config/electro/pricing/profile.json
+chmod 600 ~/.config/electro/pricing/profile.json
+```
+
+**Replace the invented example rates, tax fractions and dates before using
+the profile for real costs.** There is no built-in household tariff or
+silent fallback. Keep contracts, invoices, profile history and real replay
+fixtures private; only synthetic examples belong in this repository.
+
+```bash
+ELECTRICITY_PRICING_PROFILE="$HOME/.config/electro/pricing/profile.json" \
+  uv run electrisity-price-mcp
+```
+
+The profile specifies EUR, Europe/Tallinn, a version, finite coverage dates,
+an explicit rounding policy, source evidence and effective-dated rules.
+`from` is inclusive; `until` is exclusive and may be null on an individual
+indefinite rule. The overall profile requires a finite coverage end.
+Unknown fields, missing sources, rule gaps/overlaps and unsupported structures
+are errors. Rate fields are **VAT-exclusive decimal strings**; `vat_rate` is
+a fraction, not a percentage. Gross rates are not accepted as a separate
+input basis or silently converted.
+
+| Component kind | Meaning of its configured `rate` |
+| --- | --- |
+| `spot` | EUR/kWh adjustment added to the matching published EUR/MWh price divided by 1000. Import is a cost; export proceeds are negated into customer-cost convention. Use a negative adjustment for a buyback deduction. |
+| `unit` | EUR/kWh charge on the selected billable import/export direction, such as excise or balancing fees. |
+| `banded` | Net EUR/kWh `band_rates`: `day` and `night`, optionally with both `weekday_peak` and `rest_peak`. |
+| `monthly` | Net EUR per calendar month for one stable component/obligation ID. No energy direction. |
+
+The supported network calendar uses Tallinn working weekdays 07:00-22:00 for
+day pricing; weekends, statutory holidays and other hours are night.
+Configured winter peaks apply November-March: working days 09:00-12:00 and
+16:00-20:00; rest days 16:00-20:00. The holiday calendar follows the current
+Estonian holiday act, including Good Friday, Easter Sunday and Pentecost;
+Easter Monday is not a statutory holiday.
+
+Effective-dated netting rules choose either `gross` or `quarter_hour_net`.
+The latter bills `max(import - export, 0)` and `max(export - import, 0)`
+**within each quarter**, never across a whole day or month.
+
+`tax_treatment` distinguishes `taxable` from `outside_vat`. Outside-VAT
+amounts require a zero VAT fraction but are not labeled zero-rated taxable
+sales. Export balancing can therefore be taxable even when the energy credit
+is outside VAT. Negative spot prices and negative export proceeds are retained.
+
+### Tools
+
+| Tool | Inputs and behavior |
+| --- | --- |
+| `quote_electricity_interval` | Offset-aware `start`/`end` for exactly one aligned 15-minute interval, `consumption_kwh` and/or `export_kwh`, and `quantity_basis` (`raw` by default, or `billable`). Returns variable costs before VAT, VAT and after VAT; monthly fees are excluded. |
+| `calculate_electricity_period` | `start_date`, optional inclusive `end_date`, optional `intervals`, `quantity_basis`, `mode` (`report` or `monthly`) and optional `include_daily`. Supports complete days, weeks, months and multi-month/year ranges. |
+
+Quantities are interval **kWh**, not power. They are multiplied by their
+matching market price without another duration factor. Decimal strings are
+preferred; numeric readings from the consumption MCP are also accepted at
+their supplied precision. No hourly/monthly quantity is distributed into
+invented quarters.
+
+An interval quote can select just one explicitly billable direction. Raw
+quotes require both directions whenever netting applies. Period calculations
+require both directions for every interval. Missing/null is never zero.
+Already-netted billable inputs are not netted again, and cannot contain two
+positive directions in one netting interval.
+
+For example, a supplied-quantity quote uses:
+
+```json
+{
+  "start": "2026-10-01T22:00:00+03:00",
+  "end": "2026-10-01T22:15:00+03:00",
+  "consumption_kwh": "2",
+  "export_kwh": "0",
+  "quantity_basis": "raw"
+}
+```
+
+To calculate a month from the authorized household automatically:
+
+```json
+{
+  "start_date": "2026-09-01",
+  "end_date": "2026-09-30",
+  "mode": "monthly",
+  "include_daily": true
+}
+```
+
+Omitting `intervals` selects automatic retrieval. It reuses the existing
+Keychain/environment credentials and single-household checks, requests
+quarter-hour readings and bounds upstream requests rather than issuing one
+request per quoted interval. The separate consumption MCP retains its own
+31-day limit; the pricing server composes bounded requests for longer ranges.
+Automatic pricing requires completed past calendar days. Today's unfinished
+day, missing readings, ambiguous households, unknown tariffs and unpublished
+market prices produce explicit tool errors with no partial total.
+
+Alternatively, supply `intervals` containing the consumption MCP's
+`start`, `end`, `consumption_kwh` and `export_kwh` fields. An empty list is
+not an automatic-retrieval request. Caller-provided quantities are identified
+as such, including hypothetical future quantities when the market prices
+have actually been published.
+
+### Reporting versus invoice arithmetic
+
+`report` returns **unrounded** variable amounts plus calendar-day allocation
+of fixed fees within each covered month. This is suitable for days, weeks
+and partial months; it is not a standalone supplier bill.
+
+`monthly` requires complete calendar months. It sums unrounded interval
+contributions into monthly component lines, rounds those lines, and calculates
+and rounds VAT separately per month, contract section and VAT rate. An
+annual total sums these finalized monthly results; it does not reround one
+annual taxable base.
+
+Each monthly fee is charged once per stable component ID, even if unchanged
+financial rules have different source versions. A fixed-fee amount or tax
+change inside a billing month is rejected in monthly mode because actual
+partial-contract proration is not configured; an explicitly allocated report
+remains available. Calendar-day report allocation must not be mistaken for
+a supplier's contractual partial-period billing rule.
+
+`include_daily=true` adds analytical daily allocations even in monthly mode.
+**Summing rounded displayed days or interval quotes is not an exact monthly
+invoice reconstruction.** For composition, supply the underlying interval
+readings instead.
+
+Results include exact decimal-string amounts, separate taxable net and
+outside-VAT amounts, component lines, VAT groups, raw/billable quantities,
+monthly summaries and optional daily allocations. Finalized monthly amounts
+have two decimals. Every result includes profile version/hash, source IDs and
+evidence basis, input provenance and warnings. Rates based on invoices stay
+labeled `invoice_derived`; listing reference invoice months never implies
+that a different input or an unbilled period has been invoice-verified.
+Complete metering coverage also does not establish final settlement.
+
+`ROUND_HALF_UP` and `ROUND_HALF_EVEN` are explicit profile choices. Preserve
+the supplier's demonstrated rounding stages and document any unproven tie
+policy instead of silently using the Decimal default.
+
+Totals represent energy costs and credits, not an account ledger. Interest,
+previous balances, payments and amount due are excluded. Reconcile such items
+separately when comparing a complete invoice.
+
+### Updating rates and retaining evidence
+
+Document any accepted contract-versus-invoice discrepancy alongside the
+private profile, including the written rule, working rule, checked periods
+and unresolved qualifications. Preserve repeatable private comparisons of
+line amounts, quantities and section VAT. If a future invoice differs, inspect
+those differences before changing the profile; do not fit rates automatically.
+
+Append effective-dated changes, retain prior amounts and sources, increment
+the profile version and rerun historical fixtures plus the new case. The MCP
+loads one immutable profile snapshot per call, so edits take effect on the
+next call without a restart or mixed old/new rates. Its hash is provenance,
+not a billing-line or monthly-fee occurrence ID.
+
+### Register the pricing MCP
+
+Add an entry without replacing existing servers:
+
+```json
+{
+  "mcpServers": {
+    "electrisity-price": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/vasilyevstan/electro.git@<tested-commit-sha>",
+        "electrisity-price-mcp"
+      ],
+      "env": {
+        "ELECTRICITY_PRICING_PROFILE": "~/.config/electro/pricing/profile.json"
+      },
+      "tools": [
+        "quote_electricity_interval",
+        "calculate_electricity_period"
+      ],
+      "timeout": 600000
+    }
+  }
+}
+```
+
+Only the profile path belongs in MCP configuration, never its rates, household
+identifiers or credentials. This is still a local process: GitHub publishes the
+generic executable code but does not host the private profile or household API.
+
 ## Data source
 
 The published-price tools query Elering, Estonia's transmission system operator:
@@ -461,7 +670,8 @@ Check syntax:
 
 ```bash
 uv run python -m py_compile nordpool_ee.py mcp_server.py wattcast_forecast.py \
-  elering_consumption.py elering_consumption_mcp.py
+  elering_consumption.py elering_consumption_mcp.py electricity_pricing.py \
+  electricity_pricing_mcp.py
 ```
 
 Run the CLI for a live next-day source check:
@@ -483,6 +693,12 @@ readings, independent import/export completeness and MCP output. Live checks
 should compare the same authorized meter/date window and resolution to the
 source, without publishing private response data or claiming independent
 verification of the physical meter.
+
+Pricing tests cover synthetic profile validation, interval weighting, raw/net
+flows, holiday/time-band and DST boundaries, negative prices, source status,
+rounding stages/ties, fixed-fee identity, daily allocations, annual/monthly
+composition, bounded market batches and both MCP input modes. Real invoice
+replays belong outside the public repository and CI logs.
 
 ## License
 

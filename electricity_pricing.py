@@ -3,7 +3,7 @@
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, ROUND_HALF_UP, localcontext
 from pathlib import Path
@@ -14,8 +14,11 @@ from nordpool_ee import MARKET_INTERVAL, TALLINN, UTC, market_bounds
 
 QuantityBasis = Literal["raw", "billable"]
 PeriodMode = Literal["report", "monthly"]
+ScenarioMode = Literal["load", "comparison"]
 ZERO = Decimal(0)
 CENT = Decimal("0.01")
+DECIMAL_DIGITS = 24
+MIN_DECIMAL_EXPONENT = -18
 ROUNDING = {"ROUND_HALF_UP": ROUND_HALF_UP, "ROUND_HALF_EVEN": ROUND_HALF_EVEN}
 SOURCE_BASES = {"documented", "invoice_derived", "user_reported", "policy", "synthetic"}
 KINDS = {"spot", "unit", "banded", "monthly"}
@@ -36,7 +39,7 @@ def decimal_value(value: object, label: str, nonnegative: bool = False) -> Decim
         raise PricingError("{} must be a finite decimal number.".format(label)) from None
     if not result.is_finite():
         raise PricingError("{} must be finite.".format(label))
-    if len(result.as_tuple().digits) > 24 or not -18 <= result.as_tuple().exponent <= 18 or abs(result) > Decimal("1e15"):
+    if len(result.as_tuple().digits) > DECIMAL_DIGITS or not MIN_DECIMAL_EXPONENT <= result.as_tuple().exponent <= 18 or abs(result) > Decimal("1e15"):
         raise PricingError("{} exceeds the supported decimal precision/range.".format(label))
     if nonnegative and result < 0:
         raise PricingError("{} must not be negative.".format(label))
@@ -57,12 +60,14 @@ def parse_date(value: object) -> date:
 
 def parse_instant(value: str) -> datetime:
     try:
+        if any(fraction[6:].strip("0") for fraction in re.findall(r"[.,](\d+)", value)):
+            raise ValueError
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if result.utcoffset() is None:
             raise ValueError
         return result.astimezone(UTC)
     except (AttributeError, TypeError, ValueError, OverflowError):
-        raise PricingError("Delivery timestamps must include a valid UTC offset.") from None
+        raise PricingError("Delivery timestamps must include a valid UTC offset and use at most microsecond precision.") from None
 
 
 def period_bounds(first: str, last: Optional[str] = None) -> Tuple[date, date, datetime, datetime]:
@@ -460,6 +465,49 @@ class PricingResult:
     warnings: List[str]
 
 
+@dataclass(frozen=True)
+class LoadAllocation:
+    start: str
+    end: str
+    active_start: str
+    active_end: str
+    energy_kwh: str
+
+
+@dataclass(frozen=True)
+class LoadProfile:
+    start: datetime
+    end: datetime
+    intervals: Tuple[EnergyInterval, ...]
+    allocation: Tuple[LoadAllocation, ...]
+
+
+@dataclass(frozen=True)
+class ScenarioResult:
+    currency: str
+    timezone: str
+    mode: ScenarioMode
+    start: str
+    end: str
+    accounting_start: str
+    accounting_end: str
+    interval_count: int
+    complete: bool
+    energy_kwh: Optional[str]
+    energy_allocation: List[LoadAllocation]
+    amounts: Amounts
+    lines: List[ChargeLine]
+    vat_groups: List[VatGroup]
+    baseline: Optional[PricingResult]
+    scenario: PricingResult
+    fixed_fees: str
+    profile: ProfileInfo
+    input_source: str
+    price_source: str
+    prices_retrieved_at: Optional[str]
+    warnings: List[str]
+
+
 @dataclass
 class _Contribution:
     day: date
@@ -498,6 +546,59 @@ def _local(value: datetime) -> str:
 
 def _month_end(first: date) -> date:
     return (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def _microseconds(value: timedelta) -> int:
+    return (value.days * 86400 + value.seconds) * 1000000 + value.microseconds
+
+
+def make_load(
+    profile: PricingProfile, start: str, duration_minutes: object,
+    power_kw: object = None, energy_kwh: object = None,
+) -> LoadProfile:
+    """Allocate an explicitly hypothetical constant load, never meter readings."""
+    with localcontext() as context:
+        context.prec = 80
+        if (power_kw is None) == (energy_kwh is None):
+            raise PricingError("Supply exactly one of power_kw or energy_kwh.")
+        first = parse_instant(start)
+        minutes = decimal_value(duration_minutes, "duration_minutes", True)
+        duration = minutes * 60 * 1000000
+        if duration <= 0 or duration != duration.to_integral_value():
+            raise PricingError("duration_minutes must be positive and resolve to whole microseconds.")
+        try:
+            end = first + timedelta(microseconds=int(duration))
+        except (OverflowError, ValueError):
+            raise PricingError("Duration exceeds supported datetime bounds.") from None
+        profile.check_coverage(first, end)
+        energy = (
+            decimal_value(power_kw, "power_kw", True) * minutes / 60
+            if power_kw is not None else decimal_value(energy_kwh, "energy_kwh", True)
+        )
+        quantum = Decimal(1).scaleb(max(MIN_DECIMAL_EXPONENT, energy.adjusted() - DECIMAL_DIGITS + 1))
+        rounded_energy = energy.quantize(quantum, rounding=ROUND_HALF_EVEN)
+        if energy > 0 and rounded_energy == 0:
+            raise PricingError("Computed load energy is below supported quantity precision.")
+        energy = decimal_value(_decimal_text(rounded_energy), "Computed energy_kwh", True)
+        current = first.replace(minute=first.minute - first.minute % 15, second=0, microsecond=0)
+        rows, allocation = [], []
+        allocated = ZERO
+        while current < end:
+            stop = current + MARKET_INTERVAL
+            active_start, active_end = max(first, current), min(end, stop)
+            # Round cumulative energy so residuals cannot drift or make the last bucket negative.
+            cumulative = energy if active_end == end else (
+                energy * _microseconds(active_end - first) / duration
+            ).quantize(quantum, rounding=ROUND_HALF_EVEN)
+            quantity = Decimal(_decimal_text(cumulative - allocated))
+            rows.append(EnergyInterval(current, stop, quantity, ZERO))
+            allocation.append(LoadAllocation(
+                _local(current), _local(stop), _local(active_start), _local(active_end),
+                _decimal_text(quantity),
+            ))
+            allocated = cumulative
+            current = stop
+        return LoadProfile(first, end, tuple(rows), tuple(allocation))
 
 
 def _finalize(
@@ -587,6 +688,21 @@ def validate_intervals(
                 raise PricingError("Already-netted billable flows cannot both be positive in one interval.")
         rows.append(EnergyInterval(first, last, imported, exported))
     return rows, sources
+
+
+def scenario_bounds(
+    profile: PricingProfile, intervals: Sequence[EnergyInterval], basis: QuantityBasis,
+) -> Tuple[datetime, datetime]:
+    if not intervals:
+        raise PricingError("Scenario profiles must contain complete quarter-hour readings, not an empty list.")
+    if any(row.start.utcoffset() is None or row.end.utcoffset() is None for row in intervals):
+        raise PricingError("Delivery timestamps must include a UTC offset.")
+    start = min(row.start.astimezone(UTC) for row in intervals)
+    end = max(row.end.astimezone(UTC) for row in intervals)
+    if any(value.minute % 15 or value.second or value.microsecond for value in (start, end)):
+        raise PricingError("Scenario readings must use aligned 15-minute accounting intervals.")
+    validate_intervals(profile, intervals, basis, start, end, False)
+    return start, end
 
 
 def _variable_contributions(
@@ -705,6 +821,8 @@ def _result(
         warnings.append("Unrounded quote/report amounts are not finalized invoice lines. Do not sum rounded daily quotes to reconstruct a monthly bill.")
     if mode == "interval":
         warnings.append("Monthly fixed fees and any unspecified energy direction are excluded from this interval quote.")
+    if mode == "variable":
+        warnings.append("Monthly fixed fees are excluded from this variable-cost scenario.")
     if daily:
         warnings.append("Daily amounts use calendar-day fixed-fee allocation, even when the requested total uses monthly billing.")
 
@@ -720,7 +838,7 @@ def _result(
         total(original, "consumption_kwh") if basis == "raw" else None,
         total(original, "export_kwh") if basis == "raw" else None,
         total(rows, "consumption_kwh"), total(rows, "export_kwh"),
-        {"interval": "excluded", "report": "calendar_day_allocated", "monthly": "once_per_calendar_month"}[mode],
+        {"interval": "excluded", "variable": "excluded", "report": "calendar_day_allocated", "monthly": "once_per_calendar_month"}[mode],
         amounts, lines, vat, monthly, daily,
         ProfileInfo(profile.id, profile.version, profile.sha256, profile.rounding, inferred, list(profile.reference_invoice_months), used_sources),
         "caller_supplied", "caller_supplied_published_prices", None, None, warnings,
@@ -741,6 +859,63 @@ def quote_interval(
         rows, sources = validate_intervals(profile, [interval], quantity_basis, start, end, True)
         contributions = _variable_contributions(profile, rows, prices)
         return _result(profile, [interval], rows, quantity_basis, "interval", contributions, sources, [], [])
+
+
+def price_scenario(
+    profile: PricingProfile, intervals: Sequence[EnergyInterval], prices: Mapping[datetime, Decimal],
+    quantity_basis: QuantityBasis = "billable",
+    baseline_intervals: Optional[Sequence[EnergyInterval]] = None,
+) -> ScenarioResult:
+    """Price additional billable imports, or the delta of two supplied grid profiles."""
+    with localcontext() as context:
+        context.prec = 80
+        start, end = scenario_bounds(profile, intervals, quantity_basis)
+        rows, sources = validate_intervals(profile, intervals, quantity_basis, start, end, False)
+        if baseline_intervals is None:
+            if quantity_basis != "billable" or any(row.export_kwh != ZERO for row in rows):
+                raise PricingError("Load estimates require additional billable grid import with zero export.")
+        elif scenario_bounds(profile, baseline_intervals, quantity_basis) != (start, end):
+            raise PricingError("Baseline and scenario must cover exactly the same accounting window.")
+        contributions = _variable_contributions(profile, rows, prices)
+        scenario = _result(profile, intervals, rows, quantity_basis, "variable", contributions, sources, [], [])
+        baseline = None
+        delta = list(contributions)
+        warnings = list(scenario.warnings)
+        if baseline_intervals is not None:
+            before, before_sources = validate_intervals(
+                profile, baseline_intervals, quantity_basis, start, end, False,
+            )
+            before_contributions = _variable_contributions(profile, before, prices)
+            baseline = _result(
+                profile, baseline_intervals, before, quantity_basis, "variable",
+                before_contributions, before_sources, [], [],
+            )
+            delta.extend(
+                replace(item, amount=-item.amount,
+                        quantity=-item.quantity if item.quantity is not None else None)
+                for item in before_contributions
+            )
+            warnings.extend([
+                "Both grid profiles are caller-supplied scenarios, not independently verified measurements or inferred appliance usage.",
+                "Solar/battery operation is not modeled. Recharge costs, losses and later export changes count only when represented in the supplied window.",
+            ])
+        else:
+            warnings.append("All supplied load energy is additional billable grid import; no solar, battery or thermostat offset is inferred.")
+        warnings.append("Amounts are unrounded incremental variable costs, not the exact difference between cent-rounded monthly invoices. Unchanged monthly fees are excluded.")
+        amounts, lines, vat = _finalize(delta, profile, False)
+        return ScenarioResult(
+            currency="EUR", timezone="Europe/Tallinn",
+            mode="comparison" if baseline is not None else "load",
+            start=_local(start), end=_local(end),
+            accounting_start=_local(start), accounting_end=_local(end),
+            interval_count=len(rows), complete=True,
+            energy_kwh=None if baseline is not None else scenario.billable_import_kwh,
+            energy_allocation=[], amounts=amounts, lines=lines, vat_groups=vat,
+            baseline=baseline, scenario=scenario, fixed_fees="excluded", profile=scenario.profile,
+            input_source="caller_supplied_grid_scenarios" if baseline is not None else "hypothetical_additional_grid_import",
+            price_source="caller_supplied_published_prices", prices_retrieved_at=None,
+            warnings=warnings,
+        )
 
 
 def price_period(
